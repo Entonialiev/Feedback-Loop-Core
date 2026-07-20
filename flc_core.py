@@ -1,142 +1,181 @@
 """
-Feedback Loop Core (FLC)
-Версия: 0.1.0
-Дата: 2026-07-20
-Автор: Эльшан Алиев
+Feedback Loop Core (FLC) v2.0.0
+- Раздельная статистика по эндпоинтам
+- Сохранение сигналов в JSONL
+- Поддержка payload_id для PoC
+- Конфигурируемые веса и пороги
+- Метрика размера ответа
 """
 
 import time
 import json
+import os
 from collections import deque
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Deque
 from dataclasses import dataclass, asdict
 import numpy as np
 
 
 @dataclass
 class FLCSignal:
-    """Формат сигнала обратной связи"""
+    """Формат сигнала с поддержкой payload для PoC"""
     agent_id: str
     timestamp: str
     action_id: str
-    anomaly_type: str  # "timeout" | "error_rate" | "state_delta"
-    severity: float  # 0.0 - 1.0
+    anomaly_type: str
+    severity: float
     metrics: Dict[str, Any]
+    payload_id: Optional[str] = None
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2)
+        d = asdict(self)
+        return json.dumps({k: v for k, v in d.items() if v is not None}, indent=2)
 
 
 class SensorLayer:
-    """Сенсорный слой: сбор метрик после каждого действия"""
+    """Сенсорный слой с раздельной статистикой по эндпоинтам"""
     
-    def __init__(self, window_size: int = 10):
-        self.metrics_history: Dict[str, deque] = {
-            "response_time": deque(maxlen=window_size),
-            "error_codes": deque(maxlen=window_size),
-            "state_changes": deque(maxlen=window_size)
-        }
-        self.last_action_id: Optional[str] = None
+    def __init__(self, window_size: int = 30):
+        self.window_size = window_size
+        self.metrics_history: Dict[str, Dict[str, Deque[float]]] = {}
     
-    def collect(self, action_id: str, response_time_ms: float, 
+    def _key(self, endpoint: str, method: str) -> str:
+        return f"{method}:{endpoint}"
+    
+    def collect(self, action_id: str, endpoint: str, method: str,
+                response_time_ms: float, response_size_bytes: int = 0,
                 error_code: int = 0, state_change: float = 0.0) -> Dict[str, float]:
-        """Собирает метрики после выполнения действия"""
-        self.last_action_id = action_id
-        self.metrics_history["response_time"].append(response_time_ms)
-        self.metrics_history["error_codes"].append(error_code)
-        self.metrics_history["state_changes"].append(state_change)
+        key = self._key(endpoint, method)
+        if key not in self.metrics_history:
+            self.metrics_history[key] = {
+                "response_time": deque(maxlen=self.window_size),
+                "response_size": deque(maxlen=self.window_size),
+                "error_codes": deque(maxlen=self.window_size),
+                "state_changes": deque(maxlen=self.window_size)
+            }
+        
+        hist = self.metrics_history[key]
+        hist["response_time"].append(response_time_ms)
+        hist["response_size"].append(response_size_bytes)
+        hist["error_codes"].append(error_code)
+        hist["state_changes"].append(state_change)
         
         return {
             "response_time_ms": response_time_ms,
+            "response_size_bytes": response_size_bytes,
             "error_code": error_code,
-            "state_change": state_change
+            "state_change": state_change,
+            "endpoint": endpoint,
+            "method": method,
         }
     
-    def get_recent_metrics(self) -> Dict[str, List[float]]:
-        """Возвращает последние собранные метрики"""
+    def get_statistics(self, endpoint: str, method: str) -> Dict[str, float]:
+        key = self._key(endpoint, method)
+        if key not in self.metrics_history:
+            return {"mean": 0, "median": 0, "p95": 0, "std": 0, "size_median": 0}
+        
+        hist = self.metrics_history[key]
+        time_hist = list(hist["response_time"])
+        size_hist = list(hist["response_size"])
+        
+        stats = {"mean": 0, "median": 0, "p95": 0, "std": 0, "size_median": 0}
+        
+        if len(time_hist) >= 3:
+            stats["mean"] = float(np.mean(time_hist))
+            stats["median"] = float(np.median(time_hist))
+            stats["p95"] = float(np.percentile(time_hist, 95))
+            stats["std"] = float(np.std(time_hist))
+        
+        if len(size_hist) >= 3:
+            stats["size_median"] = float(np.median(size_hist))
+        
+        return stats
+    
+    def get_recent_metrics(self, endpoint: str, method: str) -> Dict[str, List[float]]:
+        key = self._key(endpoint, method)
+        if key not in self.metrics_history:
+            return {"response_time": [], "response_size": [], "error_codes": [], "state_changes": []}
+        
+        hist = self.metrics_history[key]
         return {
-            "response_time": list(self.metrics_history["response_time"]),
-            "error_codes": list(self.metrics_history["error_codes"]),
-            "state_changes": list(self.metrics_history["state_changes"])
+            "response_time": list(hist["response_time"]),
+            "response_size": list(hist["response_size"]),
+            "error_codes": list(hist["error_codes"]),
+            "state_changes": list(hist["state_changes"])
         }
 
 
 class AnalyticalLayer:
-    """Аналитический слой: обнаружение аномалий через скользящее окно"""
-    
-    def __init__(self, window_size: int = 10, anomaly_threshold: float = 2.0):
-        self.window_size = window_size
-        self.anomaly_threshold = anomaly_threshold
+    def __init__(self):
+        pass
     
     def detect_anomaly(self, metrics: Dict[str, float], 
-                      history: Dict[str, List[float]]) -> Dict[str, float]:
-        """
-        Анализирует метрики и возвращает оценку аномальности для каждого типа
-        """
+                      stats: Dict[str, float]) -> Dict[str, float]:
         anomalies = {}
         
-        for metric_name, value in metrics.items():
-            if metric_name not in history or not history[metric_name]:
-                anomalies[metric_name] = 0.0
-                continue
-            
-            # Вычисляем среднее и стандартное отклонение
-            hist_values = history[metric_name]
-            if len(hist_values) < 2:
-                anomalies[metric_name] = 0.0
-                continue
-                
-            mean = np.mean(hist_values)
-            std = np.std(hist_values)
-            
-            if std == 0:
-                anomalies[metric_name] = 0.0
-            else:
-                z_score = abs((value - mean) / std)
-                # Нормализуем z-score в шкалу 0-1
-                severity = min(z_score / self.anomaly_threshold, 1.0)
-                anomalies[metric_name] = severity
+        if "response_time_ms" in metrics:
+            value = metrics["response_time_ms"]
+            if value > 2000:
+                anomalies["response_time"] = min(1.0, (value - 2000) / 3000)
+            elif stats.get("p95", 0) > 0 and value > stats["p95"] * 1.5:
+                anomalies["response_time"] = min(1.0, (value - stats["p95"]) / stats["p95"])
+            elif stats.get("std", 0) > 0:
+                z_score = abs((value - stats["mean"]) / stats["std"])
+                if z_score > 2.0:
+                    anomalies["response_time"] = min(1.0, z_score / 5.0)
+        
+        if "response_size_bytes" in metrics:
+            size = metrics["response_size_bytes"]
+            size_median = stats.get("size_median", 0)
+            if size_median > 0 and size > size_median * 10:
+                anomalies["response_size"] = 0.7
+            elif size > 1_000_000:
+                anomalies["response_size"] = 1.0
+        
+        if metrics.get("error_code", 0) != 0:
+            anomalies["error_rate"] = 1.0
+        
+        state_delta = abs(metrics.get("state_change", 0.0))
+        if state_delta > 10.0:
+            anomalies["state_delta"] = min(1.0, state_delta / 100.0)
+        
+        if metrics.get("endpoint") and metrics.get("method") == "api":
+            if metrics.get("response_time_ms", 0) > 500:
+                anomalies["context_api"] = 0.6
         
         return anomalies
     
-    def get_overall_severity(self, anomalies: Dict[str, float]) -> float:
-        """Вычисляет общий уровень аномальности"""
+    def get_overall_severity(self, anomalies: Dict[str, float],
+                            weights: Dict[str, float]) -> float:
         if not anomalies:
             return 0.0
-        # Усредняем с весами (ошибки важнее времени)
-        weights = {
-            "response_time_ms": 0.3,
-            "error_code": 0.6,
-            "state_change": 0.1
-        }
+        
         weighted_sum = 0.0
         total_weight = 0.0
         
-        for key, weight in weights.items():
-            if key in anomalies:
-                weighted_sum += anomalies[key] * weight
-                total_weight += weight
+        for key, severity in anomalies.items():
+            weight = weights.get(key, 0.3)
+            weighted_sum += severity * weight
+            total_weight += weight
         
-        if total_weight == 0:
-            return 0.0
-        return weighted_sum / total_weight
+        return weighted_sum / total_weight if total_weight > 0 else 0.0
 
 
 class ControlLayer:
-    """Управляющий слой: принятие решения на основе аномалий"""
-    
-    def __init__(self, severity_threshold: float = 0.6):
+    def __init__(self, severity_threshold: float = 0.3,
+                 log_file: Optional[str] = "flc_signals.jsonl"):
         self.severity_threshold = severity_threshold
         self.is_paused = False
         self.last_signal: Optional[FLCSignal] = None
+        self.log_file = log_file
+        
+        if log_file and not os.path.exists(log_file):
+            with open(log_file, "w") as f:
+                pass
     
-    def decide(self, agent_id: str, action_id: str, 
+    def decide(self, agent_id: str, action_id: str,
                severity: float, metrics: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Принимает решение: остановить, скорректировать или игнорировать
-        """
         if severity >= self.severity_threshold:
-            # Останавливаем цепочку
             self.is_paused = True
             signal = FLCSignal(
                 agent_id=agent_id,
@@ -144,84 +183,103 @@ class ControlLayer:
                 action_id=action_id,
                 anomaly_type=self._determine_anomaly_type(metrics),
                 severity=severity,
-                metrics=metrics
+                metrics=metrics,
+                payload_id=metrics.get("payload_id")
             )
             self.last_signal = signal
+            
+            if self.log_file:
+                with open(self.log_file, "a", encoding="utf-8") as f:
+                    f.write(signal.to_json() + "\n")
             
             return {
                 "decision": "pause",
                 "signal": signal.to_json(),
-                "reason": f"Severity {severity:.2f} exceeds threshold {self.severity_threshold}"
+                "reason": f"Severity {severity:.2f} >= {self.severity_threshold}"
             }
         else:
             return {
                 "decision": "continue",
                 "signal": None,
-                "reason": f"Severity {severity:.2f} below threshold {self.severity_threshold}"
+                "reason": f"Severity {severity:.2f} < {self.severity_threshold}"
             }
     
     def _determine_anomaly_type(self, metrics: Dict[str, Any]) -> str:
-        """Определяет тип аномалии на основе метрик"""
         if metrics.get("error_code", 0) >= 400:
             return "error_rate"
-        if metrics.get("response_time_ms", 0) > 1000:
+        if metrics.get("response_time_ms", 0) > 2000:
             return "timeout"
+        if metrics.get("response_size_bytes", 0) > 1_000_000:
+            return "response_size"
         if abs(metrics.get("state_change", 0.0)) > 10.0:
             return "state_delta"
         return "unknown"
     
     def reset(self):
-        """Сбрасывает состояние (для нового цикла)"""
         self.is_paused = False
         self.last_signal = None
 
 
 class FeedbackLoopCore:
-    """Основной класс FLC - объединяет все слои"""
-    
-    def __init__(self, agent_id: str, window_size: int = 10, 
-                 anomaly_threshold: float = 2.0, severity_threshold: float = 0.6):
+    def __init__(self, agent_id: str,
+                 window_size: int = 30,
+                 severity_threshold: float = 0.3,
+                 weights: Optional[Dict[str, float]] = None,
+                 log_file: Optional[str] = "flc_signals.jsonl"):
         self.agent_id = agent_id
         self.sensor = SensorLayer(window_size=window_size)
-        self.analyzer = AnalyticalLayer(
-            window_size=window_size, 
-            anomaly_threshold=anomaly_threshold
+        self.analyzer = AnalyticalLayer()
+        self.controller = ControlLayer(
+            severity_threshold=severity_threshold,
+            log_file=log_file
         )
-        self.controller = ControlLayer(severity_threshold=severity_threshold)
         self.action_counter = 0
+        self.weights = weights or {
+            "response_time": 0.4,
+            "response_size": 0.6,
+            "error_rate": 0.9,
+            "state_delta": 0.3,
+            "context_api": 0.5
+        }
     
-    def execute_action(self, action_func, *args, **kwargs) -> Dict[str, Any]:
-        """
-        Выполняет действие с встроенным контролем FLC
-        """
+    def execute_action(self, action_func, *args,
+                      endpoint: str = "default",
+                      method: str = "GET",
+                      payload_id: Optional[str] = None,
+                      **kwargs) -> Dict[str, Any]:
         self.action_counter += 1
         action_id = f"action-{self.action_counter:03d}"
         
-        # Выполняем действие и собираем метрики
         start_time = time.time()
         try:
             result = action_func(*args, **kwargs)
             error_code = 0
+            response_body = getattr(result, 'text', str(result))
         except Exception as e:
             result = {"error": str(e)}
             error_code = 500
+            response_body = str(e)
         
         elapsed_ms = (time.time() - start_time) * 1000
+        response_size = len(response_body) if response_body else 0
         
-        # Собираем метрики
         metrics = self.sensor.collect(
             action_id=action_id,
+            endpoint=endpoint,
+            method=method,
             response_time_ms=elapsed_ms,
+            response_size_bytes=response_size,
             error_code=error_code,
-            state_change=0.0  # В реальной системе здесь были бы данные о состоянии
+            state_change=0.0
         )
         
-        # Анализируем аномалии
-        history = self.sensor.get_recent_metrics()
-        anomalies = self.analyzer.detect_anomaly(metrics, history)
-        severity = self.analyzer.get_overall_severity(anomalies)
+        if payload_id is not None:
+            metrics["payload_id"] = payload_id
         
-        # Принимаем решение
+        stats = self.sensor.get_statistics(endpoint, method)
+        anomalies = self.analyzer.detect_anomaly(metrics, stats)
+        severity = self.analyzer.get_overall_severity(anomalies, self.weights)
+        
         decision = self.controller.decide(
             agent_id=self.agent_id,
             action_id=action_id,
@@ -241,77 +299,61 @@ class FeedbackLoopCore:
         }
     
     def reset(self):
-        """Сбрасывает состояние FLC"""
         self.controller.reset()
         self.action_counter = 0
 
 
-# --- Пример использования ---
 if __name__ == "__main__":
-    print("🔄 Feedback Loop Core (FLC) Demo\n")
+    print("🔄 Feedback Loop Core (FLC) v2.0.0\n")
     
-    # Создаём экземпляр FLC
     flc = FeedbackLoopCore(
-        agent_id="demo-agent-001",
-        window_size=5,
-        anomaly_threshold=1.5,
-        severity_threshold=0.5
+        agent_id="demo-agent",
+        window_size=10,
+        severity_threshold=0.3,
+        log_file="flc_demo_signals.jsonl"
     )
     
-    # Симулируем действия агента
-    def simulated_action(duration_ms: float = 200, should_fail: bool = False):
-        """Симулирует действие агента (например, запрос к API)"""
-        time.sleep(duration_ms / 1000.0)
-        if should_fail:
-            raise Exception("API connection timeout")
-        return {"status": "success", "data": {"value": 42}}
+    def simulate_api_call(delay_ms=100, size_bytes=1024):
+        time.sleep(delay_ms / 1000.0)
+        if delay_ms > 2000:
+            raise Exception("API timeout")
+        return {"status": "ok", "data": "x" * size_bytes}
     
-    print("Выполняем последовательность действий...\n")
-    
-    # Серия действий: сначала нормальные, потом аномальные
-    actions = [
-        {"duration": 100, "fail": False},
-        {"duration": 150, "fail": False},
-        {"duration": 120, "fail": False},
-        {"duration": 2000, "fail": False},  # Очень медленный ответ
-        {"duration": 100, "fail": False},
-        {"duration": 50, "fail": False},
-        {"duration": 100, "fail": True},   # Ошибка
-        {"duration": 100, "fail": False},
+    scenario = [
+        {"delay": 80, "size": 1024, "endpoint": "/api/v1/users"},
+        {"delay": 90, "size": 2048, "endpoint": "/api/v1/users"},
+        {"delay": 100, "size": 1536, "endpoint": "/api/v1/users"},
+        {"delay": 120, "size": 1024, "endpoint": "/api/v1/users"},
+        {"delay": 3000, "size": 1024, "endpoint": "/api/v1/users"},
+        {"delay": 100, "size": 5_000_000, "endpoint": "/api/v1/users"},
     ]
     
-    for i, action_params in enumerate(actions, 1):
-        duration = action_params["duration"]
-        should_fail = action_params["fail"]
-        
-        print(f"Шаг {i}: запрос с таймаутом {duration}мс...")
+    for i, params in enumerate(scenario, 1):
+        print(f"Шаг {i}: {params['endpoint']} delay={params['delay']}мс, size={params['size']}b")
         
         try:
             result = flc.execute_action(
-                simulated_action,
-                duration_ms=duration,
-                should_fail=should_fail
+                simulate_api_call,
+                params['delay'],
+                params['size'],
+                endpoint=params['endpoint'],
+                method="API",
+                payload_id=f"poc-{i:03d}"
             )
+            
+            print(f"  → {result['decision']} (severity: {result['severity']:.2f})")
+            if result['anomalies']:
+                print(f"  Обнаружены аномалии: {list(result['anomalies'].keys())}")
+            
+            if result['decision'] == 'pause':
+                print(f"  ⛔ ОСТАНОВКА!")
+                if result['signal']:
+                    print(f"  Сигнал:\n{result['signal']}")
+                break
         except Exception as e:
-            print(f"  ❌ Необработанная ошибка: {e}")
-            continue
-        
-        # Выводим результат
-        print(f"  Решение: {result['decision']}")
-        print(f"  Severity: {result['severity']:.2f}")
-        
-        if result['decision'] == 'pause':
-            print(f"  ⛔ ОСТАНОВКА ЦЕПОЧКИ!")
-            print(f"  Причина: {result['reason']}")
-            if result['signal']:
-                print(f"  Сигнал FLC:\n{result['signal']}")
-            break
-        
-        print(f"  ✅ Продолжаем...")
-        print()
+            print(f"  ❌ Ошибка: {e}")
     
-    print("\n--- Статистика ---")
-    print(f"Всего выполнено действий: {flc.action_counter}")
-    print(f"Состояние FLC: {'ОСТАНОВЛЕН' if flc.controller.is_paused else 'Активен'}")
-    if flc.controller.is_paused:
-        print(f"Причина остановки: {flc.controller.last_signal.anomaly_type}")
+    print(f"\n--- Статистика ---")
+    print(f"Выполнено действий: {flc.action_counter}")
+    print(f"Состояние: {'ОСТАНОВЛЕН' if flc.controller.is_paused else 'Активен'}")
+    print(f"Сигналы сохранены в: {flc.controller.log_file}")
